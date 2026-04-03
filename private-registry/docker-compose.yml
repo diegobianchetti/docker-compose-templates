@@ -1,0 +1,109 @@
+# =============================================================================
+# Template: Registry Privado — Docker Registry v2 + nginx (autenticação básica)
+# =============================================================================
+# Ambiente mínimo para hospedar um registry Docker privado em infraestrutura
+# própria. Adequado para equipes pequenas sem acesso a registries gerenciados
+# (ECR, GCR, Harbor) ou para ambientes air-gapped.
+#
+# Componentes:
+#   registry — Docker Distribution v2 (backend de armazenamento)
+#   nginx    — reverse proxy com autenticação HTTP básica e TLS
+#
+# Pré-requisitos:
+#   1. Certificado TLS válido (Let's Encrypt ou CA interna)
+#   2. Arquivo htpasswd gerado com bcrypt:
+#      docker run --rm httpd:2.4-alpine htpasswd -Bbn usuario senha > auth/htpasswd
+#
+# Uso:
+#   cp .env.example .env && vi .env
+#   docker compose up -d
+#
+# Push de imagem após configurado:
+#   docker login registry.example.br
+#   docker tag minhaapp:1.0 registry.example.br/minhaapp:1.0
+#   docker push registry.example.br/minhaapp:1.0
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # registry — Docker Distribution v2
+  # ---------------------------------------------------------------------------
+  # Não expõe porta diretamente para o host.
+  # Todo acesso passa pelo nginx (autenticação + TLS).
+  # ---------------------------------------------------------------------------
+  registry:
+    image: registry:2.8.3
+    container_name: ${COMPOSE_PROJECT_NAME}-registry
+    restart: unless-stopped
+    environment:
+      # Diretório interno onde as imagens são armazenadas
+      REGISTRY_STORAGE_FILESYSTEM_ROOTDIRECTORY: /var/lib/registry
+
+      # Habilita exclusão de imagens via API (necessário para GC manual)
+      REGISTRY_STORAGE_DELETE_ENABLED: "true"
+
+      # Logs em formato JSON facilitam ingestão por ferramentas de observabilidade
+      REGISTRY_LOG_FORMATTER: json
+      REGISTRY_LOG_LEVEL: ${REGISTRY_LOG_LEVEL:-warn}
+
+      # Endereço HTTP interno — nginx faz o TLS externamente
+      REGISTRY_HTTP_ADDR: 0.0.0.0:5000
+    volumes:
+      # Volume nomeado para os dados do registry — nunca bind mount em produção
+      - registry-data:/var/lib/registry
+    networks:
+      - registry-internal
+    healthcheck:
+      # /v2/ retorna 401 (não autenticado) mas prova que o daemon está up
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:5000/v2/"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # nginx — reverse proxy com autenticação básica e TLS
+  # ---------------------------------------------------------------------------
+  # Expõe a porta HTTPS para o host.
+  # Autentica com htpasswd antes de fazer proxy para o registry.
+  # ---------------------------------------------------------------------------
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: ${COMPOSE_PROJECT_NAME}-nginx
+    restart: unless-stopped
+    ports:
+      - "${REGISTRY_PORT:-443}:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ${TLS_CERT_DIR:-./nginx/certs}:/etc/nginx/certs:ro
+      # Arquivo htpasswd gerado com bcrypt (ver comando acima)
+      - ${HTPASSWD_FILE:-./auth/htpasswd}:/etc/nginx/htpasswd:ro
+    networks:
+      - registry-internal
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "--no-check-certificate", "https://localhost/v2/"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    depends_on:
+      registry:
+        condition: service_healthy
+
+networks:
+  registry-internal:
+    # Rede interna: nginx e registry se comunicam aqui.
+    # `internal: true` bloqueia saída para internet nesta rede.
+    # O registry não precisa de acesso externo; todas as imagens são push.
+    name: ${COMPOSE_PROJECT_NAME}-internal
+    driver: bridge
+    internal: true
+
+volumes:
+  registry-data:
+    name: ${COMPOSE_PROJECT_NAME}-data
+    # Para storage em S3 ou GCS, substitua este volume pela configuração
+    # de driver de storage externo no bloco `environment` do serviço `registry`.
+    # Documentação: https://distribution.github.io/distribution/storage-drivers/

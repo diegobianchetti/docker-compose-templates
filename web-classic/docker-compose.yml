@@ -1,0 +1,166 @@
+# =============================================================================
+# Template: Web Clássico — nginx + app + banco de dados
+# =============================================================================
+# Padrão de produção com:
+#   - Rede isolada por stack (sem acesso à rede padrão do Docker)
+#   - Healthchecks em todos os serviços
+#   - depends_on com condition: service_healthy (não apenas depends_on simples)
+#   - Volumes nomeados para dados persistentes
+#   - Variáveis sensíveis via .env (nunca hardcoded)
+#
+# Uso:
+#   cp .env.example .env && vi .env
+#   docker compose up -d
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # nginx — reverse proxy e terminação TLS
+  # ---------------------------------------------------------------------------
+  # Recebe o tráfego externo e faz proxy para o serviço `app`.
+  # Expõe apenas as portas 80/443 para o host; o serviço `app` fica interno.
+  # ---------------------------------------------------------------------------
+  nginx:
+    image: nginx:1.27-alpine
+    # Versão pinada: nunca usar `latest` em produção.
+    # Ver seção "Decisões Técnicas" no README.
+    container_name: ${COMPOSE_PROJECT_NAME}-nginx
+    restart: unless-stopped
+    ports:
+      - "${NGINX_HTTP_PORT:-80}:80"
+      - "${NGINX_HTTPS_PORT:-443}:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      # Certificados TLS montados como read-only
+      - ${TLS_CERT_DIR:-./nginx/certs}:/etc/nginx/certs:ro
+      # Volume nomeado para cache de proxy (não bind mount — ver README)
+      - nginx-cache:/var/cache/nginx
+    networks:
+      - frontend
+    # Healthcheck via endpoint interno — não depende de curl no PATH
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    depends_on:
+      app:
+        condition: service_healthy
+        # Só sobe após o app estar healthy — evita erros 502 no nginx
+        # durante a inicialização. Ver "Decisões Técnicas" no README.
+
+  # ---------------------------------------------------------------------------
+  # app — serviço de aplicação
+  # ---------------------------------------------------------------------------
+  # Substituir pela imagem real da aplicação.
+  # Não expõe porta para o host — tráfego só via nginx (rede `frontend`).
+  # Conectado também à rede `backend` para acessar o banco.
+  # ---------------------------------------------------------------------------
+  app:
+    image: your-registry.example.br/nome-app:1.4.2
+    # Exemplo fictício — substitua pela imagem real com tag semântica.
+    container_name: ${COMPOSE_PROJECT_NAME}-app
+    restart: unless-stopped
+    # Sem `ports:` — app não é acessível diretamente pelo host
+    environment:
+      APP_ENV: ${APP_ENV:-production}
+      APP_PORT: ${APP_PORT:-8080}
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      # Credenciais do banco montadas via variável de ambiente, não hardcoded.
+      # Em produção real, considerar Docker Secrets ou Vault para POSTGRES_PASSWORD.
+      SECRET_KEY: ${APP_SECRET_KEY}
+    volumes:
+      # Volume nomeado para uploads/artefatos gerados pela aplicação
+      - app-data:/var/app/data
+    networks:
+      - frontend   # para receber tráfego do nginx
+      - backend    # para acessar o banco de dados
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:${APP_PORT:-8080}/health"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+      # start_period elevado: aplicações Java/JVM precisam de mais tempo para JVM warm-up.
+      # Ajustar conforme o tempo real de boot da aplicação.
+    depends_on:
+      db:
+        condition: service_healthy
+        # App só inicia após o banco estar aceitando conexões.
+        # Elimina a necessidade de retry manual na connection string.
+
+  # ---------------------------------------------------------------------------
+  # db — banco de dados PostgreSQL
+  # ---------------------------------------------------------------------------
+  # Acessível apenas pela rede `backend` — não expõe porta para o host.
+  # Para acesso administrativo pontual, usar:
+  #   docker compose exec db psql -U $POSTGRES_USER $POSTGRES_DB
+  # ---------------------------------------------------------------------------
+  db:
+    image: postgres:16.3-alpine
+    # Alpine reduz a superfície de ataque e o tamanho da imagem.
+    # Tag inclui patch version para builds reproduzíveis.
+    container_name: ${COMPOSE_PROJECT_NAME}-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      # POSTGRES_INITDB_ARGS permite passar flags para initdb se necessário,
+      # ex: "--encoding=UTF8 --locale=pt_BR.UTF-8"
+      POSTGRES_INITDB_ARGS: ${POSTGRES_INITDB_ARGS:---encoding=UTF8}
+    volumes:
+      # Volume nomeado — dados do banco nunca em bind mount (ver README)
+      - db-data:/var/lib/postgresql/data
+      # Scripts SQL de inicialização (executados apenas no primeiro start)
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    networks:
+      - backend
+    healthcheck:
+      # pg_isready verifica se o postgres está aceitando conexões,
+      # mais confiável que testar a porta TCP diretamente.
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+# =============================================================================
+# Redes
+# =============================================================================
+# Duas redes separadas por responsabilidade:
+#   frontend — nginx <-> app (tráfego HTTP interno)
+#   backend  — app   <-> db  (tráfego de dados, mais restrito)
+#
+# O banco de dados NÃO está na rede `frontend`, portanto nginx não consegue
+# alcançá-lo nem por erro de configuração. Isolamento por design.
+# =============================================================================
+networks:
+  frontend:
+    name: ${COMPOSE_PROJECT_NAME}-frontend
+    driver: bridge
+  backend:
+    name: ${COMPOSE_PROJECT_NAME}-backend
+    driver: bridge
+    # `internal: true` impediria acesso à internet a partir desta rede.
+    # Útil se o banco não precisa fazer pull de extensões externas.
+    # Descomentado por padrão para não bloquear instalação de extensões.
+    # internal: true
+
+# =============================================================================
+# Volumes
+# =============================================================================
+# Volumes nomeados gerenciados pelo Docker — não bind mounts.
+# Vantagens em produção: backup via `docker run --volumes-from`, portabilidade
+# entre hosts, permissões gerenciadas pelo daemon. Ver README.
+# =============================================================================
+volumes:
+  db-data:
+    name: ${COMPOSE_PROJECT_NAME}-db-data
+  app-data:
+    name: ${COMPOSE_PROJECT_NAME}-app-data
+  nginx-cache:
+    name: ${COMPOSE_PROJECT_NAME}-nginx-cache

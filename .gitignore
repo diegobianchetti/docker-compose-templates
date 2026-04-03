@@ -1,0 +1,19 @@
+# Variáveis de ambiente com valores reais — nunca commitar
+.env
+**/.env
+
+# Arquivo de senhas do registry
+auth/htpasswd
+
+# Certificados TLS reais
+**/*.pem
+**/*.key
+**/*.crt
+**/*.p12
+
+# Diretório de dados local (se usado em testes)
+**/data/
+
+# Arquivos de sistema
+.DS_Store
+Thumbs.db
